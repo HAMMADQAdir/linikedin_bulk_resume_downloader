@@ -103,17 +103,16 @@ async function init() {
       updateProgress(0, count);
 
       if (count === 0) {
-        setStatus("idle", "No downloadable resumes found — try Debug Scan");
-        btnStart.textContent = "No Resumes Found";
+        setStatus("idle", "No applicant cards found — try Debug Scan");
+        btnStart.textContent = "No Applicants Found";
         btnStart.disabled = true;
-        addLog("0 resume download buttons detected. Click Debug Scan to inspect the page.", "error");
-        // Auto-run debug scan when nothing found
+        addLog("0 applicant cards detected. Scroll down to load more, then re-open popup.", "error");
         runDebugScan();
       } else {
-        setStatus("idle", `Found ${count} resume(s) ready to download`);
+        setStatus("idle", `Found ${count} applicant(s) ready to download`);
         btnStart.textContent = `▶ Start Bulk Download (${count})`;
         btnStart.disabled = false;
-        addLog(`Scan complete — ${count} resume(s) detected.`, "success");
+        addLog(`Scan complete — ${count} applicant(s) found in the list.`, "success");
       }
     });
   } catch (err) {
@@ -137,10 +136,21 @@ function runDebugScan() {
     const d = response.debug;
     addLog(`Page: ${d.url}`, "info");
     addLog(`Total buttons: ${d.totalButtons} | Total links: ${d.totalLinks}`, "info");
-    addLog(`Resume preview buttons (data-view-name): ${d.resumePreviewButtons}`, d.resumePreviewButtons > 0 ? "success" : "error");
-    addLog(`Download icons (svg#download-small): ${d.downloadIconsVisible}`, "info");
+    addLog(`Applicant cards found: ${d.applicantCardsFound}`, d.applicantCardsFound > 0 ? "success" : "error");
 
-    // Buttons with data-view-name
+    // List applicant names found
+    if (d.applicantNames && d.applicantNames.length > 0) {
+      addLog(`── Applicant names (${d.applicantNames.length}):`, "info");
+      d.applicantNames.forEach((name, idx) => {
+        addLog(`  ${idx + 1}. ${name}`, "info");
+      });
+    }
+
+    // Resume button status
+    addLog(`Resume button visible in detail panel: ${d.resumeButtonVisible ? "YES (" + d.resumeButtonText + ")" : "NO"}`, d.resumeButtonVisible ? "success" : "info");
+    addLog(`Download icon visible: ${d.downloadIconVisible ? "YES" : "NO"}`, "info");
+
+    // data-view-name buttons
     if (d.dataViewButtons && d.dataViewButtons.length > 0) {
       addLog(`── Buttons with data-view-name (${d.dataViewButtons.length}):`, "info");
       d.dataViewButtons.forEach((b) => {
@@ -148,21 +158,11 @@ function runDebugScan() {
       });
     }
 
-    // Relevant buttons (Resume / Download text)
+    // Relevant buttons
     if (d.relevantButtons && d.relevantButtons.length > 0) {
       addLog(`── Buttons with Resume/Download text (${d.relevantButtons.length}):`, "info");
       d.relevantButtons.forEach((b) => {
-        addLog(`  "${b.text}" view=${b.dataViewName} aria=${b.ariaLabel}`, "info");
-      });
-    } else {
-      addLog("No buttons with 'Resume' or 'Download' text found.", "error");
-    }
-
-    // Leaf elements
-    if (d.allResumeDownloadLeafs && d.allResumeDownloadLeafs.length > 0) {
-      addLog(`── Leaf elements with resume/download (${d.allResumeDownloadLeafs.length}):`, "info");
-      d.allResumeDownloadLeafs.slice(0, 15).forEach((el) => {
-        addLog(`  <${el.tag}> "${el.text}" parent=<${el.parentTag}> view=${el.parentDataView}`, "info");
+        addLog(`  "${b.text}" view=${b.dataViewName}`, "info");
       });
     }
   });
