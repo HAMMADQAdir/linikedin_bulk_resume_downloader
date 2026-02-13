@@ -7,10 +7,13 @@
     "downloads",
     "tabs",
     "activeTab",
-    "scripting"
+    "scripting",
+    "webNavigation"
   ],
   "host_permissions": [
-    "https://www.linkedin.com/*"
+    "https://www.linkedin.com/*",
+    "https://*.linkedin.com/*",
+    "https://*.licdn.com/*"
   ],
   "background": {
     "service_worker": "background.js"

@@ -7,6 +7,11 @@
 const downloadQueue = [];
 let isProcessingQueue = false;
 
+// ── PDF Tab Watcher ───────────────────────────────────────
+// When content script signals EXPECT_PDF_TAB, we watch for new tabs
+// opened from LinkedIn and auto-download + close them.
+let pendingPdfDownload = null;   // { candidateName, timeoutId, sourceTabId }
+
 // ── Message Listener ──────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -17,15 +22,86 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ── Expect a new PDF tab (content script couldn't grab URL) ──
+  if (msg.type === "EXPECT_PDF_TAB") {
+    clearPdfWatch();
+    pendingPdfDownload = {
+      candidateName: msg.candidateName,
+      sourceTabId: sender.tab ? sender.tab.id : -1,
+      timeoutId: setTimeout(clearPdfWatch, 30000), // 30s safety timeout
+    };
+    console.log(`[LBRD] Watching for PDF tab for: ${msg.candidateName} (source tab: ${pendingPdfDownload.sourceTabId})`);
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // ── Relay progress / done / error messages to popup ─────
-  if (["PROGRESS", "DONE", "DOWNLOAD_ERROR"].includes(msg.type)) {
-    // Forward to popup (all extension views will receive it)
-    chrome.runtime.sendMessage(msg).catch(() => {
-      // Popup may be closed — safe to ignore
-    });
+  if (["PROGRESS", "DONE", "DOWNLOAD_ERROR", "LOG"].includes(msg.type)) {
+    chrome.runtime.sendMessage(msg).catch(() => {});
   }
 
   return false;
+});
+
+function clearPdfWatch() {
+  if (pendingPdfDownload) {
+    clearTimeout(pendingPdfDownload.timeoutId);
+    pendingPdfDownload = null;
+  }
+}
+
+function isPdfLikeUrl(url) {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes(".pdf") ||
+    lower.includes("mediaauth") ||
+    lower.includes("ambry") ||
+    lower.includes("dms/") ||
+    lower.includes("media.licdn.com") ||
+    lower.includes("resumeViewer") ||
+    lower.includes("resume") ||
+    (lower.includes("licdn.com") && !lower.includes(".js") && !lower.includes(".css"))
+  );
+}
+
+// ── Watch for new tabs — ANY new tab counts while expecting PDF ──
+
+function handleNewTabUrl(tabId, url) {
+  if (!pendingPdfDownload) return;
+  if (!url || url === "" || url === "about:blank" || url === "chrome://newtab/") return;
+  if (tabId === pendingPdfDownload.sourceTabId) return; // skip the source tab
+
+  const candidateName = pendingPdfDownload.candidateName;
+  console.log(`[LBRD] New tab detected (tabId=${tabId}): ${url.substring(0, 120)}`);
+
+  // Download the PDF and close the tab
+  enqueueDownload(url, candidateName);
+  clearPdfWatch();
+
+  // Close the PDF tab after giving download API a moment to start
+  setTimeout(() => {
+    chrome.tabs.remove(tabId).catch(() => {});
+  }, 2000);
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!pendingPdfDownload) return;
+  const url = tab.pendingUrl || tab.url || "";
+  console.log(`[LBRD] tabs.onCreated: tabId=${tab.id}, url=${url.substring(0, 80)}`);
+  if (url && url !== "about:blank" && url !== "chrome://newtab/") {
+    handleNewTabUrl(tab.id, url);
+  }
+  // If URL is blank, onUpdated will fire later with the real URL
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!pendingPdfDownload) return;
+  // Only act on URL changes or when loading completes
+  const url = changeInfo.url || "";
+  if (url) {
+    handleNewTabUrl(tabId, url);
+  }
 });
 
 // ── Queue Processor ───────────────────────────────────────

@@ -22,7 +22,7 @@ if (window.__lbrd_cleanup) {
 
   // ── Helpers ─────────────────────────────────────────────
 
-  const randomDelay = (min = 5, max = 15) =>
+  const randomDelay = (min = 2, max = 5) =>
     new Promise((r) => setTimeout(r, (Math.random() * (max - min) + min) * 1000));
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -251,14 +251,14 @@ if (window.__lbrd_cleanup) {
 
     log(`  Clicking: <${clickTarget.tagName}> "${clickTarget.textContent.trim().substring(0, 40)}…"`);
     clickTarget.scrollIntoView({ behavior: "smooth", block: "center" });
-    await sleep(800);
+    await sleep(400);
 
     // Full mouse event sequence for realism
     for (const type of ["mousedown", "mouseup", "click"]) {
       clickTarget.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
     }
 
-    await sleep(3000); // wait for detail panel to load
+    await sleep(1500); // wait for detail panel to load
   }
 
   // ══════════════════════════════════════════════════════════
@@ -342,6 +342,157 @@ if (window.__lbrd_cleanup) {
   }
 
   // ══════════════════════════════════════════════════════════
+  //  EXTRACT PDF URL from the resume preview popup
+  // ══════════════════════════════════════════════════════════
+
+  function extractPdfUrl() {
+    // 1. Check <iframe> sources (LinkedIn often renders PDF in an iframe)
+    for (const iframe of document.querySelectorAll("iframe")) {
+      const src = iframe.src || "";
+      if (src && (src.includes(".pdf") || src.includes("mediaauth") || src.includes("resume") || src.includes("dms/"))) {
+        log(`  ✓ PDF URL from iframe: ${src.substring(0, 80)}…`);
+        return src;
+      }
+    }
+
+    // 2. Check <embed> elements
+    for (const embed of document.querySelectorAll("embed")) {
+      const src = embed.src || "";
+      if (src && (src.includes(".pdf") || src.includes("mediaauth") || src.includes("resume"))) {
+        log(`  ✓ PDF URL from embed: ${src.substring(0, 80)}…`);
+        return src;
+      }
+    }
+
+    // 3. Check <object> elements
+    for (const obj of document.querySelectorAll("object")) {
+      const data = obj.data || "";
+      if (data && (data.includes(".pdf") || data.includes("mediaauth") || data.includes("resume"))) {
+        log(`  ✓ PDF URL from object: ${data.substring(0, 80)}…`);
+        return data;
+      }
+    }
+
+    // 4. Check anchors near the download button / in modal / dialog
+    const modals = document.querySelectorAll('[role="dialog"], [role="presentation"], [class*="modal"], [class*="overlay"]');
+    for (const modal of modals) {
+      for (const a of modal.querySelectorAll("a[href]")) {
+        const href = a.href || "";
+        if (href && (href.includes(".pdf") || href.includes("mediaauth") || href.includes("dms/"))) {
+          log(`  ✓ PDF URL from modal anchor: ${href.substring(0, 80)}…`);
+          return href;
+        }
+      }
+    }
+
+    // 5. Broad search for any anchor with PDF-like URL in the whole page
+    for (const a of document.querySelectorAll("a[href]")) {
+      const href = a.href || "";
+      if (
+        href &&
+        (href.includes(".pdf") || href.includes("mediaauth")) &&
+        !href.includes("/hiring/") && !href.includes("/jobs/") && !href.includes("/in/")
+      ) {
+        log(`  ✓ PDF URL from page anchor: ${href.substring(0, 80)}…`);
+        return href;
+      }
+    }
+
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  INTERCEPT window.open IN THE MAIN WORLD via <script> injection
+  //  Content scripts run in an isolated world — they CANNOT override
+  //  the page's window.open. We must inject into the page itself.
+  // ══════════════════════════════════════════════════════════
+
+  let interceptedUrl = null;
+
+  function startWindowOpenIntercept() {
+    interceptedUrl = null;
+
+    // Listen for messages from the injected page script
+    window.addEventListener("message", onInterceptMessage);
+
+    // Inject a <script> into the page's main world
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        if (window.__lbrd_origOpen) return; // already patched
+        window.__lbrd_origOpen = window.open;
+        window.open = function(url) {
+          var s = String(url || "");
+          // Post the URL back to the content script
+          window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
+          // Always block the new tab — we'll download it ourselves
+          return null;
+        };
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
+  }
+
+  function onInterceptMessage(event) {
+    if (event.source !== window) return;
+    if (event.data && event.data.__lbrd_intercepted) {
+      interceptedUrl = event.data.url;
+      log(`  ✓ Intercepted window.open URL (main world): ${interceptedUrl.substring(0, 80)}…`);
+    }
+  }
+
+  function stopWindowOpenIntercept() {
+    window.removeEventListener("message", onInterceptMessage);
+
+    // Restore original window.open in the page world
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        if (window.__lbrd_origOpen) {
+          window.open = window.__lbrd_origOpen;
+          delete window.__lbrd_origOpen;
+        }
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
+
+    const captured = interceptedUrl;
+    interceptedUrl = null;
+    return captured;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  INTERCEPT <a target="_blank"> clicks (another way LinkedIn opens PDFs)
+  // ══════════════════════════════════════════════════════════
+
+  function interceptLinkClicks() {
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        document.addEventListener("click", function(e) {
+          var a = e.target.closest ? e.target.closest("a") : null;
+          if (a && a.href && (a.target === "_blank" || a.getAttribute("target") === "_blank")) {
+            var href = a.href.toLowerCase();
+            if (href.includes(".pdf") || href.includes("mediaauth") || href.includes("resume")
+                || href.includes("dms/") || href.includes("media.licdn")) {
+              e.preventDefault();
+              e.stopPropagation();
+              window.postMessage({ __lbrd_intercepted: true, url: a.href }, "*");
+            }
+          }
+        }, true);
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
+  }
+
+  // Inject link click interceptor on load
+  interceptLinkClicks();
+
+  // ══════════════════════════════════════════════════════════
   //  CLOSE popup
   // ══════════════════════════════════════════════════════════
 
@@ -352,16 +503,16 @@ if (window.__lbrd_cleanup) {
       ".artdeco-modal__dismiss", 'button[data-test-modal-close-btn]',
     ]) {
       const btn = document.querySelector(sel);
-      if (btn) { btn.click(); log("  Closed popup"); await sleep(500); return; }
+      if (btn) { btn.click(); log("  Closed popup"); await sleep(300); return; }
     }
 
     for (const modal of document.querySelectorAll('[role="dialog"], [role="presentation"]')) {
       const btn = modal.querySelector('button[aria-label*="ismiss" i], button[aria-label*="lose" i]');
-      if (btn) { btn.click(); log("  Closed modal"); await sleep(500); return; }
+      if (btn) { btn.click(); log("  Closed modal"); await sleep(300); return; }
     }
 
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
-    log("  Sent Escape"); await sleep(500);
+    log("  Sent Escape"); await sleep(300);
   }
 
   // ══════════════════════════════════════════════════════════
@@ -391,34 +542,70 @@ if (window.__lbrd_cleanup) {
         if (!resumeBtn) {
           log(`  ✗ No Resume button for ${name}`); failed++;
           notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(3, 6);
+          if (i < applicantCards.length - 1) await randomDelay(1, 3);
           continue;
         }
 
         resumeBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(500);
+        await sleep(200);
         log("  Step 2: Clicking Resume…");
         resumeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 
         log("  Step 3: Waiting for popup…");
-        await sleep(2500);
+        await sleep(1200);
         const downloadBtn = await findDownloadButton(10000);
         if (!downloadBtn) {
           log(`  ✗ No Download button for ${name}`); failed++;
           await closePreviewPopup();
           notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(3, 6);
+          if (i < applicantCards.length - 1) await randomDelay(1, 3);
           continue;
         }
 
         downloadBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(300);
-        log("  Step 3: Clicking Download…");
+        await sleep(150);
 
-        if (downloadBtn.tagName === "A" && downloadBtn.href) {
+        // ── Always tell background to watch for new PDF tabs as safety net ──
+        chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+
+        // ── Try to extract the PDF URL directly from the preview ──
+        let pdfUrl = extractPdfUrl();
+
+        if (pdfUrl) {
+          // We already have the URL — download via background without clicking
+          log(`  Step 3: Direct PDF URL found, sending to background…`);
+          chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+        } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
+          // It's a link — grab href and download via background
+          log(`  Step 3: Download link href found, sending to background…`);
           chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
         } else {
+          // Must click the button — intercept window.open in main world
+          log("  Step 3: Clicking Download (with interception)…");
+
+          // Intercept window.open in page's main world
+          startWindowOpenIntercept();
+
+          // Click the download button
           downloadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+          await sleep(2000); // wait for interception or new tab
+
+          // Check if we intercepted a URL via window.open
+          const capturedUrl = stopWindowOpenIntercept();
+          if (capturedUrl) {
+            log(`  Step 3: Captured URL via interception, sending to background…`);
+            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: capturedUrl, candidateName: name });
+          } else {
+            // Check again for PDF URL that may have appeared after click
+            const postClickUrl = extractPdfUrl();
+            if (postClickUrl) {
+              log(`  Step 3: Found PDF URL after click, sending to background…`);
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
+            } else {
+              log("  Step 3: Relying on background tab watcher to capture the PDF tab");
+            }
+          }
         }
 
         downloaded++;
@@ -426,20 +613,20 @@ if (window.__lbrd_cleanup) {
         notify("PROGRESS", { downloaded, total, failed, candidateName: name });
 
         log("  Step 4: Closing popup…");
-        await sleep(2000);
+        await sleep(800);
         await closePreviewPopup();
-        await sleep(1000);
+        await sleep(500);
       } catch (err) {
         log(`  ✗ Error: ${err.message}`); failed++;
         notify("DOWNLOAD_ERROR", { candidateName: name, error: err.message });
         notify("PROGRESS", { downloaded, total, failed });
-        await closePreviewPopup(); await sleep(500);
+        await closePreviewPopup(); await sleep(300);
       }
 
       if (i < applicantCards.length - 1 && !stopRequested) {
-        const d = 5 + Math.random() * 10;
+        const d = 2 + Math.random() * 3;
         log(`  ⏳ Waiting ${d.toFixed(1)}s…`);
-        await randomDelay(5, 15);
+        await randomDelay(2, 5);
       }
     }
 
