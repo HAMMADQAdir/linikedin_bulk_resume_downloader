@@ -7,6 +7,21 @@
 const downloadQueue = [];
 let isProcessingQueue = false;
 
+// ── Download State (for popup reconnection) ────────────────
+let downloadState = {
+  running: false,
+  downloaded: 0,
+  total: 0,
+  failed: 0,
+  lastCandidate: "",
+  logs: [],        // Keep last 50 log lines
+};
+
+function pushLog(msg) {
+  downloadState.logs.push(msg);
+  if (downloadState.logs.length > 50) downloadState.logs.shift();
+}
+
 // ── PDF Tab Watcher ───────────────────────────────────────
 // When content script signals EXPECT_PDF_TAB, we watch for new tabs
 // opened from LinkedIn and auto-download + close them.
@@ -15,6 +30,31 @@ let pendingPdfDownload = null;   // { candidateName, timeoutId, sourceTabId }
 // ── Message Listener ──────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // ── Popup asks for current state (reconnection after reopen) ──
+  if (msg.type === "GET_STATE") {
+    sendResponse({ state: downloadState });
+    return true;
+  }
+
+  // ── Content script notifies download started / stopped ──
+  if (msg.type === "DOWNLOAD_STARTED") {
+    downloadState.running = true;
+    downloadState.total = msg.total || 0;
+    downloadState.downloaded = 0;
+    downloadState.failed = 0;
+    downloadState.logs = [];
+    pushLog("Bulk download started.");
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === "DOWNLOAD_STOPPED") {
+    downloadState.running = false;
+    pushLog("Download stopped.");
+    sendResponse({ ok: true });
+    return true;
+  }
+
   // ── Download request from content script ────────────────
   if (msg.type === "DOWNLOAD_RESUME") {
     enqueueDownload(msg.url, msg.candidateName);
@@ -37,6 +77,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── Relay progress / done / error messages to popup ─────
   if (["PROGRESS", "DONE", "DOWNLOAD_ERROR", "LOG"].includes(msg.type)) {
+    // Update persistent state
+    if (msg.type === "PROGRESS") {
+      downloadState.downloaded = msg.downloaded || downloadState.downloaded;
+      downloadState.total = msg.total || downloadState.total;
+      downloadState.failed = msg.failed || downloadState.failed;
+      downloadState.lastCandidate = msg.candidateName || "";
+      if (msg.candidateName) pushLog(`✓ Downloaded: ${msg.candidateName}`);
+    }
+    if (msg.type === "DOWNLOAD_ERROR") {
+      downloadState.failed = (downloadState.failed || 0) + 1;
+      pushLog(`✗ Failed: ${msg.candidateName || "unknown"} — ${msg.error}`);
+    }
+    if (msg.type === "LOG") {
+      pushLog(msg.message || "");
+    }
+    if (msg.type === "DONE") {
+      downloadState.running = false;
+      downloadState.downloaded = msg.downloaded || downloadState.downloaded;
+      downloadState.total = msg.total || downloadState.total;
+      downloadState.failed = msg.failed || downloadState.failed;
+      pushLog(`All done! ${msg.downloaded} resume(s) downloaded, ${msg.failed} failed.`);
+    }
+
     chrome.runtime.sendMessage(msg).catch(() => {});
   }
 
@@ -67,22 +130,62 @@ function isPdfLikeUrl(url) {
 
 // ── Watch for new tabs — ANY new tab counts while expecting PDF ──
 
-function handleNewTabUrl(tabId, url) {
+async function handleNewTabUrl(tabId, url) {
   if (!pendingPdfDownload) return;
   if (!url || url === "" || url === "about:blank" || url === "chrome://newtab/") return;
   if (tabId === pendingPdfDownload.sourceTabId) return; // skip the source tab
 
   const candidateName = pendingPdfDownload.candidateName;
-  console.log(`[LBRD] New tab detected (tabId=${tabId}): ${url.substring(0, 120)}`);
-
-  // Download the PDF and close the tab
-  enqueueDownload(url, candidateName);
+  const filename = buildFilename(candidateName);
+  console.log(`[LBRD] PDF tab detected (tabId=${tabId}): ${url.substring(0, 120)}`);
   clearPdfWatch();
 
-  // Close the PDF tab after giving download API a moment to start
+  // Strategy 1: Try to download from within the tab using fetch+blob
+  // (the tab already has the PDF loaded, so re-fetching from same origin works)
+  try {
+    // Wait a moment for the tab to finish loading
+    await sleep(2000);
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tabId },
+      func: async (fname) => {
+        try {
+          const resp = await fetch(window.location.href, { credentials: "include" });
+          if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+          const blob = await resp.blob();
+          const u = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = u;
+          a.download = fname;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(u), 15000);
+          return { ok: true };
+        } catch (e) {
+          return { ok: false, error: e.message };
+        }
+      },
+      args: [filename],
+    });
+
+    const r = results?.[0]?.result;
+    if (r && r.ok) {
+      console.log(`[LBRD] In-tab fetch+download succeeded for: ${filename}`);
+    } else {
+      console.log(`[LBRD] In-tab fetch failed (${r?.error}), falling back to chrome.downloads`);
+      await triggerDownload(url, filename);
+    }
+  } catch (err) {
+    // executeScript might fail on chrome:// PDF viewer pages
+    console.log(`[LBRD] executeScript failed (${err.message}), falling back to chrome.downloads`);
+    await triggerDownload(url, filename);
+  }
+
+  // Close the PDF tab after download starts
   setTimeout(() => {
     chrome.tabs.remove(tabId).catch(() => {});
-  }, 2000);
+  }, 3000);
 }
 
 chrome.tabs.onCreated.addListener((tab) => {

@@ -75,6 +75,43 @@ async function init() {
       return;
     }
 
+    // ── Check if a download is already running (popup was reopened) ──
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: "GET_STATE" });
+      if (resp && resp.state && resp.state.running) {
+        // Reconnect to running download
+        isRunning = true;
+        const s = resp.state;
+        setStatus("running", "Downloading resumes…");
+        btnStart.textContent = "⏳ Running…";
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+        updateProgress(s.downloaded, s.total, s.failed);
+        // Replay logs
+        if (s.logs && s.logs.length > 0) {
+          s.logs.forEach(l => addLog(l, "info"));
+        }
+        addLog("Popup reconnected — download still in progress.", "success");
+        return;  // Skip scanning — download is already running
+      }
+      // Check if it just finished
+      if (resp && resp.state && !resp.state.running && resp.state.downloaded > 0) {
+        const s = resp.state;
+        setStatus("done", `Finished — ${s.downloaded} of ${s.total} downloaded`);
+        btnStart.textContent = "✅ Complete";
+        btnStart.disabled = true;
+        btnStop.disabled = true;
+        updateProgress(s.downloaded, s.total, s.failed);
+        if (s.logs && s.logs.length > 0) {
+          s.logs.forEach(l => addLog(l, "info"));
+        }
+        addLog("Previous download session completed.", "success");
+        return;
+      }
+    } catch (_) {
+      // Background not ready or no state — continue with normal scan
+    }
+
     // Inject content script if not already present (handles pages that
     // were open before the extension was installed)
     try {

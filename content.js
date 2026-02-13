@@ -22,9 +22,11 @@ if (window.__lbrd_cleanup) {
 
   // ── Helpers ─────────────────────────────────────────────
 
-  const randomDelay = (min = 2, max = 5) =>
+  const randomDelay = (min = 0, max = 5) =>
     new Promise((r) => setTimeout(r, (Math.random() * (max - min) + min) * 1000));
 
+  // Random sleep: 0 to ms
+  const rsleep = (ms) => new Promise((r) => setTimeout(r, Math.random() * ms));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function sanitiseName(raw) {
@@ -251,14 +253,14 @@ if (window.__lbrd_cleanup) {
 
     log(`  Clicking: <${clickTarget.tagName}> "${clickTarget.textContent.trim().substring(0, 40)}…"`);
     clickTarget.scrollIntoView({ behavior: "smooth", block: "center" });
-    await sleep(400);
+    await rsleep(400);
 
     // Full mouse event sequence for realism
     for (const type of ["mousedown", "mouseup", "click"]) {
       clickTarget.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
     }
 
-    await sleep(1500); // wait for detail panel to load
+    await sleep(800 + Math.random() * 700); // wait for detail panel to load
   }
 
   // ══════════════════════════════════════════════════════════
@@ -402,30 +404,95 @@ if (window.__lbrd_cleanup) {
   }
 
   // ══════════════════════════════════════════════════════════
+  //  FETCH + BLOB DOWNLOAD — downloads PDF with session cookies
+  //  This avoids the one-time-token problem where chrome.downloads
+  //  makes a second HTTP request that fails.
+  // ══════════════════════════════════════════════════════════
+
+  function buildDownloadFilename(candidateName) {
+    let safe = (candidateName || "Unknown_Candidate")
+      .trim().replace(/\s+/g, "_").replace(/[^\w\-]/g, "").substring(0, 80);
+    if (!safe) safe = "Unknown_Candidate";
+    const ts = new Date().toISOString().slice(0, 10);
+    return `${safe}_Resume_${ts}.pdf`;
+  }
+
+  async function downloadViaFetch(url, candidateName) {
+    const filename = buildDownloadFilename(candidateName);
+    log(`  Fetching PDF blob from: ${url.substring(0, 80)}…`);
+    try {
+      const resp = await fetch(url, { credentials: "include" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      log(`  ✓ Blob download triggered: ${filename}`);
+      return true;
+    } catch (err) {
+      log(`  ⚠ Fetch-blob failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════
   //  INTERCEPT window.open IN THE MAIN WORLD via <script> injection
   //  Content scripts run in an isolated world — they CANNOT override
   //  the page's window.open. We must inject into the page itself.
+  //  The injected code ALSO fetches the PDF as a blob and triggers
+  //  a download directly (so the one-time URL isn't wasted).
   // ══════════════════════════════════════════════════════════
 
   let interceptedUrl = null;
+  let mainWorldDownloaded = false;
+  let interceptListenerActive = false;
 
-  function startWindowOpenIntercept() {
+  function startWindowOpenIntercept(candidateName) {
     interceptedUrl = null;
+    mainWorldDownloaded = false;
 
-    // Listen for messages from the injected page script
-    window.addEventListener("message", onInterceptMessage);
+    // Listen for messages from the injected page script (only add once)
+    if (!interceptListenerActive) {
+      window.addEventListener("message", onInterceptMessage);
+      interceptListenerActive = true;
+    }
+
+    const filename = buildDownloadFilename(candidateName);
 
     // Inject a <script> into the page's main world
+    // Re-inject every time to update the filename for the current candidate
     const script = document.createElement("script");
     script.textContent = `
       (function() {
-        if (window.__lbrd_origOpen) return; // already patched
-        window.__lbrd_origOpen = window.open;
+        if (!window.__lbrd_origOpen) {
+          window.__lbrd_origOpen = window.open;
+        }
+        window.__lbrd_currentFilename = ${JSON.stringify(filename)};
         window.open = function(url) {
           var s = String(url || "");
-          // Post the URL back to the content script
           window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
-          // Always block the new tab — we'll download it ourselves
+          fetch(s, { credentials: "include" })
+            .then(function(r) { return r.blob(); })
+            .then(function(blob) {
+              var u = URL.createObjectURL(blob);
+              var a = document.createElement("a");
+              a.href = u;
+              a.download = window.__lbrd_currentFilename || "Resume.pdf";
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
+              window.postMessage({ __lbrd_download_done: true }, "*");
+            })
+            .catch(function(err) {
+              window.postMessage({ __lbrd_download_failed: true, error: err.message }, "*");
+            });
           return null;
         };
       })();
@@ -438,29 +505,23 @@ if (window.__lbrd_cleanup) {
     if (event.source !== window) return;
     if (event.data && event.data.__lbrd_intercepted) {
       interceptedUrl = event.data.url;
-      log(`  ✓ Intercepted window.open URL (main world): ${interceptedUrl.substring(0, 80)}…`);
+      log(`  ✓ Intercepted URL (main world): ${interceptedUrl.substring(0, 80)}…`);
+    }
+    if (event.data && event.data.__lbrd_download_done) {
+      mainWorldDownloaded = true;
+      log("  ✓ Main-world fetch+download succeeded!");
+    }
+    if (event.data && event.data.__lbrd_download_failed) {
+      log(`  ⚠ Main-world fetch failed: ${event.data.error}`);
     }
   }
 
-  function stopWindowOpenIntercept() {
-    window.removeEventListener("message", onInterceptMessage);
-
-    // Restore original window.open in the page world
-    const script = document.createElement("script");
-    script.textContent = `
-      (function() {
-        if (window.__lbrd_origOpen) {
-          window.open = window.__lbrd_origOpen;
-          delete window.__lbrd_origOpen;
-        }
-      })();
-    `;
-    document.documentElement.appendChild(script);
-    script.remove();
-
-    const captured = interceptedUrl;
+  // Don't restore window.open between downloads — keep it patched
+  function checkInterceptResult() {
+    const result = { url: interceptedUrl, downloadedInMainWorld: mainWorldDownloaded };
     interceptedUrl = null;
-    return captured;
+    mainWorldDownloaded = false;
+    return result;
   }
 
   // ══════════════════════════════════════════════════════════
@@ -480,6 +541,21 @@ if (window.__lbrd_cleanup) {
               e.preventDefault();
               e.stopPropagation();
               window.postMessage({ __lbrd_intercepted: true, url: a.href }, "*");
+              // Also fetch and download
+              fetch(a.href, { credentials: "include" })
+                .then(function(r) { return r.blob(); })
+                .then(function(blob) {
+                  var u = URL.createObjectURL(blob);
+                  var el = document.createElement("a");
+                  el.href = u;
+                  el.download = "Resume.pdf";
+                  document.body.appendChild(el);
+                  el.click();
+                  el.remove();
+                  setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
+                  window.postMessage({ __lbrd_download_done: true }, "*");
+                })
+                .catch(function() {});
             }
           }
         }, true);
@@ -503,16 +579,16 @@ if (window.__lbrd_cleanup) {
       ".artdeco-modal__dismiss", 'button[data-test-modal-close-btn]',
     ]) {
       const btn = document.querySelector(sel);
-      if (btn) { btn.click(); log("  Closed popup"); await sleep(300); return; }
+      if (btn) { btn.click(); log("  Closed popup"); await rsleep(300); return; }
     }
 
     for (const modal of document.querySelectorAll('[role="dialog"], [role="presentation"]')) {
       const btn = modal.querySelector('button[aria-label*="ismiss" i], button[aria-label*="lose" i]');
-      if (btn) { btn.click(); log("  Closed modal"); await sleep(300); return; }
+      if (btn) { btn.click(); log("  Closed modal"); await rsleep(300); return; }
     }
 
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, bubbles: true }));
-    log("  Sent Escape"); await sleep(300);
+    log("  Sent Escape"); await rsleep(300);
   }
 
   // ══════════════════════════════════════════════════════════
@@ -526,8 +602,11 @@ if (window.__lbrd_cleanup) {
 
     log(`Starting bulk download for ${total} applicant(s)…`);
 
+    // Notify background so popup can reconnect
+    chrome.runtime.sendMessage({ type: "DOWNLOAD_STARTED", total }).catch(() => {});
+
     for (let i = 0; i < applicantCards.length; i++) {
-      if (stopRequested) { notify("DONE", { downloaded, total, failed }); return; }
+      if (stopRequested) { notify("DONE", { downloaded, total, failed }); chrome.runtime.sendMessage({ type: "DOWNLOAD_STOPPED" }).catch(() => {}); return; }
 
       const card = applicantCards[i];
       const name = card.name;
@@ -542,68 +621,87 @@ if (window.__lbrd_cleanup) {
         if (!resumeBtn) {
           log(`  ✗ No Resume button for ${name}`); failed++;
           notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(1, 3);
+          if (i < applicantCards.length - 1) await randomDelay(0, 3);
           continue;
         }
 
         resumeBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(200);
+        await rsleep(200);
         log("  Step 2: Clicking Resume…");
         resumeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 
         log("  Step 3: Waiting for popup…");
-        await sleep(1200);
+        await sleep(600 + Math.random() * 600);
         const downloadBtn = await findDownloadButton(10000);
         if (!downloadBtn) {
           log(`  ✗ No Download button for ${name}`); failed++;
           await closePreviewPopup();
           notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(1, 3);
+          if (i < applicantCards.length - 1) await randomDelay(0, 3);
           continue;
         }
 
         downloadBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(150);
+        await rsleep(150);
 
-        // ── Always tell background to watch for new PDF tabs as safety net ──
+        // ── Always tell background to watch for new PDF tabs as LAST-RESORT safety net ──
         chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
 
         // ── Try to extract the PDF URL directly from the preview ──
         let pdfUrl = extractPdfUrl();
+        let dlSuccess = false;
 
         if (pdfUrl) {
-          // We already have the URL — download via background without clicking
-          log(`  Step 3: Direct PDF URL found, sending to background…`);
-          chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+          // We already have the URL — fetch as blob and download
+          log(`  Step 3: Direct PDF URL found, fetching blob…`);
+          dlSuccess = await downloadViaFetch(pdfUrl, name);
+          if (!dlSuccess) {
+            // Fallback: send to background
+            log(`  Step 3: Blob failed, sending URL to background…`);
+            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+          }
         } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
-          // It's a link — grab href and download via background
-          log(`  Step 3: Download link href found, sending to background…`);
-          chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
+          // It's a link — fetch as blob
+          log(`  Step 3: Download link href found, fetching blob…`);
+          dlSuccess = await downloadViaFetch(downloadBtn.href, name);
+          if (!dlSuccess) {
+            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
+          }
         } else {
           // Must click the button — intercept window.open in main world
-          log("  Step 3: Clicking Download (with interception)…");
+          // The injected script will ALSO fetch+download the PDF as a blob
+          log("  Step 3: Clicking Download (with main-world interception + fetch)…");
 
-          // Intercept window.open in page's main world
-          startWindowOpenIntercept();
+          startWindowOpenIntercept(name);
 
           // Click the download button
           downloadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
 
-          await sleep(2000); // wait for interception or new tab
+          await sleep(1500 + Math.random() * 1500); // wait for fetch+download in main world
 
-          // Check if we intercepted a URL via window.open
-          const capturedUrl = stopWindowOpenIntercept();
-          if (capturedUrl) {
-            log(`  Step 3: Captured URL via interception, sending to background…`);
-            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: capturedUrl, candidateName: name });
+          const result = checkInterceptResult();
+          if (result.downloadedInMainWorld) {
+            log("  ✓ Downloaded via main-world fetch!");
+            dlSuccess = true;
+          } else if (result.url) {
+            // Main world fetch failed but we got the URL — try from content script
+            log("  Step 3: Trying content-script fetch with captured URL…");
+            dlSuccess = await downloadViaFetch(result.url, name);
+            if (!dlSuccess) {
+              // Last resort: send URL to background
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: result.url, candidateName: name });
+            }
           } else {
-            // Check again for PDF URL that may have appeared after click
+            // Nothing intercepted — check for PDF URL that appeared after click
             const postClickUrl = extractPdfUrl();
             if (postClickUrl) {
-              log(`  Step 3: Found PDF URL after click, sending to background…`);
-              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
+              log(`  Step 3: Found PDF URL after click, fetching…`);
+              dlSuccess = await downloadViaFetch(postClickUrl, name);
+              if (!dlSuccess) {
+                chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
+              }
             } else {
-              log("  Step 3: Relying on background tab watcher to capture the PDF tab");
+              log("  Step 3: Relying on background tab watcher (last resort)");
             }
           }
         }
@@ -613,25 +711,26 @@ if (window.__lbrd_cleanup) {
         notify("PROGRESS", { downloaded, total, failed, candidateName: name });
 
         log("  Step 4: Closing popup…");
-        await sleep(800);
+        await rsleep(800);
         await closePreviewPopup();
-        await sleep(500);
+        await rsleep(500);
       } catch (err) {
         log(`  ✗ Error: ${err.message}`); failed++;
         notify("DOWNLOAD_ERROR", { candidateName: name, error: err.message });
         notify("PROGRESS", { downloaded, total, failed });
-        await closePreviewPopup(); await sleep(300);
+        await closePreviewPopup(); await rsleep(300);
       }
 
       if (i < applicantCards.length - 1 && !stopRequested) {
-        const d = 2 + Math.random() * 3;
+        const d = Math.random() * 5;
         log(`  ⏳ Waiting ${d.toFixed(1)}s…`);
-        await randomDelay(2, 5);
+        await randomDelay(0, 5);
       }
     }
 
     log(`\n✅ Done! Downloaded: ${downloaded}, Failed: ${failed}`);
     notify("DONE", { downloaded, total, failed });
+    chrome.runtime.sendMessage({ type: "DOWNLOAD_STOPPED" }).catch(() => {});
   }
 
   // ══════════════════════════════════════════════════════════
