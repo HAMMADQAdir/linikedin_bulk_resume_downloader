@@ -29,6 +29,86 @@ if (window.__lbrd_cleanup) {
   const rsleep = (ms) => new Promise((r) => setTimeout(r, Math.random() * ms));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // ── Human-like mouse movement + click ───────────────────
+  // Simulates: jitter → smooth glide → jitter → hover → click
+  // with randomized timing to mimic real human behavior.
+
+  function getElCenter(el) {
+    const r = el.getBoundingClientRect();
+    // Randomise click point within inner 60% of element
+    return {
+      x: r.left + r.width * (0.2 + Math.random() * 0.6),
+      y: r.top + r.height * (0.2 + Math.random() * 0.6),
+    };
+  }
+
+  async function humanMouseMove(target) {
+    const dest = getElCenter(target);
+    // Start from a random nearby point (simulates cursor already in general area)
+    let cx = dest.x - 80 - Math.random() * 200;
+    let cy = dest.y - 60 - Math.random() * 150;
+
+    const steps = 8 + Math.floor(Math.random() * 10); // 8-17 steps
+    for (let s = 0; s < steps; s++) {
+      const t = (s + 1) / steps; // 0→1 progress
+
+      // Ease-in-out bezier-ish interpolation
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+      let nx = cx + (dest.x - cx) * ease;
+      let ny = cy + (dest.y - cy) * ease;
+
+      // Add jitter — stronger at start/end, subtle in the middle
+      const jitterPhase = (t < 0.2 || t > 0.8) ? 1 : 0.3;
+      nx += (Math.random() - 0.5) * 6 * jitterPhase;
+      ny += (Math.random() - 0.5) * 4 * jitterPhase;
+
+      target.dispatchEvent(new MouseEvent("mousemove", {
+        clientX: nx, clientY: ny, bubbles: true, cancelable: true,
+      }));
+
+      // Variable speed: fast in middle, slow at ends
+      const stepDelay = t < 0.15 || t > 0.85
+        ? 20 + Math.random() * 30
+        : 6 + Math.random() * 14;
+      await sleep(stepDelay);
+    }
+
+    // Final small jitter-settle at destination
+    for (let j = 0; j < 2 + Math.floor(Math.random() * 3); j++) {
+      target.dispatchEvent(new MouseEvent("mousemove", {
+        clientX: dest.x + (Math.random() - 0.5) * 2,
+        clientY: dest.y + (Math.random() - 0.5) * 2,
+        bubbles: true, cancelable: true,
+      }));
+      await sleep(10 + Math.random() * 20);
+    }
+
+    return dest;
+  }
+
+  async function humanClick(el) {
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    await sleep(100 + Math.random() * 200); // wait for scroll
+
+    const pos = await humanMouseMove(el);
+
+    // Hover pause (humans hesitate slightly before clicking)
+    await sleep(50 + Math.random() * 150);
+
+    // mouseenter + mouseover
+    el.dispatchEvent(new MouseEvent("mouseenter", { clientX: pos.x, clientY: pos.y, bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mouseover",  { clientX: pos.x, clientY: pos.y, bubbles: true }));
+    await sleep(20 + Math.random() * 40);
+
+    // mousedown → small delay → mouseup → click  (realistic press duration)
+    el.dispatchEvent(new MouseEvent("mousedown", { clientX: pos.x, clientY: pos.y, bubbles: true, cancelable: true, button: 0 }));
+    await sleep(40 + Math.random() * 80); // hold duration
+    el.dispatchEvent(new MouseEvent("mouseup",   { clientX: pos.x, clientY: pos.y, bubbles: true, cancelable: true, button: 0 }));
+    await sleep(5 + Math.random() * 15);
+    el.dispatchEvent(new MouseEvent("click",     { clientX: pos.x, clientY: pos.y, bubbles: true, cancelable: true, button: 0 }));
+  }
+
   function sanitiseName(raw) {
     return raw.trim().replace(/\s+/g, "_").replace(/[^\w\-]/g, "").substring(0, 80) || "Unknown_Candidate";
   }
@@ -252,15 +332,11 @@ if (window.__lbrd_cleanup) {
       el;
 
     log(`  Clicking: <${clickTarget.tagName}> "${clickTarget.textContent.trim().substring(0, 40)}…"`);
-    clickTarget.scrollIntoView({ behavior: "smooth", block: "center" });
-    await rsleep(400);
 
-    // Full mouse event sequence for realism
-    for (const type of ["mousedown", "mouseup", "click"]) {
-      clickTarget.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
-    }
+    // Human-like mouse movement + click
+    await humanClick(clickTarget);
 
-    await sleep(800 + Math.random() * 700); // wait for detail panel to load
+    await sleep(600 + Math.random() * 900); // wait for detail panel to load
   }
 
   // ══════════════════════════════════════════════════════════
@@ -293,7 +369,7 @@ if (window.__lbrd_cleanup) {
         }
       }
 
-      await sleep(500);
+      await rsleep(600);
     }
     log("  ⚠ Resume button NOT found"); return null;
   }
@@ -338,7 +414,7 @@ if (window.__lbrd_cleanup) {
         }
       }
 
-      await sleep(500);
+      await rsleep(600);
     }
     log("  ⚠ Download button NOT found"); return null;
   }
@@ -625,10 +701,8 @@ if (window.__lbrd_cleanup) {
           continue;
         }
 
-        resumeBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await rsleep(200);
         log("  Step 2: Clicking Resume…");
-        resumeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        await humanClick(resumeBtn);
 
         log("  Step 3: Waiting for popup…");
         await sleep(600 + Math.random() * 600);
@@ -641,8 +715,8 @@ if (window.__lbrd_cleanup) {
           continue;
         }
 
-        downloadBtn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await rsleep(150);
+        // Pause before interacting with download button
+        await rsleep(200);
 
         // ── Always tell background to watch for new PDF tabs as LAST-RESORT safety net ──
         chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
@@ -674,8 +748,8 @@ if (window.__lbrd_cleanup) {
 
           startWindowOpenIntercept(name);
 
-          // Click the download button
-          downloadBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+          // Human-like click on the download button
+          await humanClick(downloadBtn);
 
           await sleep(1500 + Math.random() * 1500); // wait for fetch+download in main world
 
