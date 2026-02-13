@@ -7,6 +7,7 @@
 const $ = (id) => document.getElementById(id);
 const btnStart        = $("btnStart");
 const btnStop         = $("btnStop");
+const btnDebug        = $("btnDebug");
 const statusDot       = $("statusDot");
 const statusText      = $("statusText");
 const foundCount      = $("foundCount");
@@ -63,7 +64,8 @@ async function init() {
     const isLinkedInPage =
       url.includes("linkedin.com/hiring") ||
       url.includes("linkedin.com/talent") ||
-      url.includes("linkedin.com/jobs");
+      url.includes("linkedin.com/jobs") ||
+      url.includes("linkedin.com/recruiter");
 
     if (!isLinkedInPage) {
       setStatus("error", "Not a LinkedIn Hiring / Jobs page");
@@ -101,10 +103,12 @@ async function init() {
       updateProgress(0, count);
 
       if (count === 0) {
-        setStatus("idle", "No downloadable resumes found on this page");
+        setStatus("idle", "No downloadable resumes found — try Debug Scan");
         btnStart.textContent = "No Resumes Found";
         btnStart.disabled = true;
-        addLog("0 resume download buttons detected.", "error");
+        addLog("0 resume download buttons detected. Click Debug Scan to inspect the page.", "error");
+        // Auto-run debug scan when nothing found
+        runDebugScan();
       } else {
         setStatus("idle", `Found ${count} resume(s) ready to download`);
         btnStart.textContent = `▶ Start Bulk Download (${count})`;
@@ -117,6 +121,54 @@ async function init() {
     addLog(err.message, "error");
   }
 }
+
+// ── Debug Scan ─────────────────────────────────────────────
+
+function runDebugScan() {
+  if (!currentTabId) return;
+  addLog("Running debug scan…", "info");
+
+  chrome.tabs.sendMessage(currentTabId, { action: "DEBUG_SCAN" }, (response) => {
+    if (chrome.runtime.lastError || !response || !response.debug) {
+      addLog("Debug scan failed — content script not responding.", "error");
+      return;
+    }
+
+    const d = response.debug;
+    addLog(`Page: ${d.url}`, "info");
+    addLog(`Total buttons: ${d.totalButtons} | Total links: ${d.totalLinks}`, "info");
+    addLog(`Resume preview buttons (data-view-name): ${d.resumePreviewButtons}`, d.resumePreviewButtons > 0 ? "success" : "error");
+    addLog(`Download icons (svg#download-small): ${d.downloadIconsVisible}`, "info");
+
+    // Buttons with data-view-name
+    if (d.dataViewButtons && d.dataViewButtons.length > 0) {
+      addLog(`── Buttons with data-view-name (${d.dataViewButtons.length}):`, "info");
+      d.dataViewButtons.forEach((b) => {
+        addLog(`  [${b.dataViewName}] "${b.text}"`, "info");
+      });
+    }
+
+    // Relevant buttons (Resume / Download text)
+    if (d.relevantButtons && d.relevantButtons.length > 0) {
+      addLog(`── Buttons with Resume/Download text (${d.relevantButtons.length}):`, "info");
+      d.relevantButtons.forEach((b) => {
+        addLog(`  "${b.text}" view=${b.dataViewName} aria=${b.ariaLabel}`, "info");
+      });
+    } else {
+      addLog("No buttons with 'Resume' or 'Download' text found.", "error");
+    }
+
+    // Leaf elements
+    if (d.allResumeDownloadLeafs && d.allResumeDownloadLeafs.length > 0) {
+      addLog(`── Leaf elements with resume/download (${d.allResumeDownloadLeafs.length}):`, "info");
+      d.allResumeDownloadLeafs.slice(0, 15).forEach((el) => {
+        addLog(`  <${el.tag}> "${el.text}" parent=<${el.parentTag}> view=${el.parentDataView}`, "info");
+      });
+    }
+  });
+}
+
+btnDebug.addEventListener("click", runDebugScan);
 
 // ── Start Download ─────────────────────────────────────────
 
@@ -159,6 +211,10 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg.type === "DOWNLOAD_ERROR") {
     addLog(`✗ Failed: ${msg.candidateName || "unknown"} — ${msg.error}`, "error");
+  }
+
+  if (msg.type === "LOG") {
+    addLog(msg.message, "info");
   }
 
   if (msg.type === "DONE") {

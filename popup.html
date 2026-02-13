@@ -173,6 +173,17 @@
       color: #aaa;
       font-style: italic;
     }
+    .log-area pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: 10px;
+      background: #f8f8f8;
+      padding: 6px;
+      border-radius: 4px;
+      margin: 4px 0;
+      max-height: 200px;
+      overflow-y: auto;
+    }
     .log-entry.error { color: #cc1016; }
     .log-entry.success { color: #057642; }
 
@@ -233,6 +244,9 @@
     <div class="actions">
       <button class="btn btn-primary" id="btnStart" disabled>⏳ Checking…</button>
       <button class="btn btn-danger" id="btnStop" disabled>■ Stop</button>
+    </div>
+    <div style="margin-top:10px">
+      <button class="btn btn-primary" id="btnDebug" style="width:100%;background:#555">🔍 Debug Scan Page</button>
     </div>
 
     <!-- Log -->

@@ -1,8 +1,13 @@
 /**
  * content.js – LinkedIn Bulk Resume Downloader
- * Runs on LinkedIn hiring / talent pages.
- * Detects resume download buttons, clicks them one-by-one with randomised
- * human-like delays, and forwards download URLs to the background worker.
+ *
+ * LinkedIn's hiring/applicants page uses a TWO-STEP flow:
+ *   1. Click the "Resume" button (data-view-name="hiring-applicant-view-resume")
+ *      → this opens a resume preview popup/modal.
+ *   2. Inside the popup, click the "Download" button (contains svg#download-small
+ *      and a span with text "Download") to trigger the actual file download.
+ *
+ * This script automates both steps with human-like delays.
  */
 
 (() => {
@@ -11,76 +16,20 @@
   window.__lbrd_injected = true;
 
   // ── State ───────────────────────────────────────────────
-  let resumeButtons = [];
+  let resumeButtons = [];   // The "Resume" preview buttons on the page
   let stopRequested = false;
-
-  // ── Selectors ───────────────────────────────────────────
-  // LinkedIn can change its DOM; we try several possible selectors.
-  const BUTTON_SELECTORS = [
-    'button[aria-label*="Download resume"]',
-    'button[aria-label*="download resume"]',
-    'button[aria-label*="Download Resume"]',
-    'a[aria-label*="Download resume"]',
-    'a[aria-label*="download resume"]',
-    'button[data-test-download-resume]',
-    'button[data-view-name="hiring-applicant-view-resume"]',
-    // Fallback: any link/button whose text says "Download" inside an
-    // applicant card context
-    '.hiring-applicant-header button[aria-label*="Download"]',
-    '.hiring-applicant-header a[aria-label*="Download"]',
-    '.artdeco-modal button[aria-label*="Download"]',
-  ];
 
   // ── Helpers ─────────────────────────────────────────────
 
-  /** Create a random delay between min and max milliseconds */
   function randomDelay(minSec = 5, maxSec = 15) {
     const ms = (Math.random() * (maxSec - minSec) + minSec) * 1000;
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /** Sleep helper */
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /** Try to extract the candidate name near a download button */
-  function extractCandidateName(button) {
-    // Strategy 1: aria-label often contains the name
-    const ariaLabel = button.getAttribute("aria-label") || "";
-    // e.g. "Download resume for John Doe"
-    const match = ariaLabel.match(/Download\s+resume\s+(?:for\s+)?(.+)/i);
-    if (match && match[1]) return sanitiseName(match[1]);
-
-    // Strategy 2: walk up to the applicant card and look for a heading / link
-    const card =
-      button.closest(".hiring-applicant-header") ||
-      button.closest(".artdeco-entity-lockup") ||
-      button.closest("[data-test-applicant]") ||
-      button.closest(".hiring-applicants-list-item") ||
-      button.closest("li");
-
-    if (card) {
-      const nameEl =
-        card.querySelector("h3") ||
-        card.querySelector("h2") ||
-        card.querySelector(".artdeco-entity-lockup__title") ||
-        card.querySelector("a[data-control-name]") ||
-        card.querySelector("span.t-16") ||
-        card.querySelector("span.t-bold");
-      if (nameEl) return sanitiseName(nameEl.textContent);
-    }
-
-    // Strategy 3: previous sibling text
-    const prev = button.previousElementSibling;
-    if (prev && prev.textContent.trim().length > 1 && prev.textContent.trim().length < 80) {
-      return sanitiseName(prev.textContent);
-    }
-
-    return "Unknown_Candidate";
-  }
-
-  /** Clean a name string so it's filesystem-friendly */
   function sanitiseName(raw) {
     return raw
       .trim()
@@ -89,92 +38,222 @@
       .substring(0, 80) || "Unknown_Candidate";
   }
 
-  /** Scan the page for resume download buttons */
-  function scanForButtons() {
+  // ══════════════════════════════════════════════════════════
+  //  STEP 1 — FIND ALL "Resume" PREVIEW BUTTONS
+  // ══════════════════════════════════════════════════════════
+
+  function scanForResumeButtons() {
     const found = new Set();
 
-    for (const selector of BUTTON_SELECTORS) {
-      document.querySelectorAll(selector).forEach((el) => found.add(el));
-    }
+    // ── Primary selector: the exact data attribute from LinkedIn's DOM ──
+    document
+      .querySelectorAll('button[data-view-name="hiring-applicant-view-resume"]')
+      .forEach((el) => found.add(el));
 
-    // Additional heuristic: any <a> whose href contains "media" and "resume"
-    document.querySelectorAll('a[href*="resume"], a[href*="Resume"]').forEach((el) => {
-      if (el.href && (el.href.includes(".pdf") || el.href.includes("media"))) {
-        found.add(el);
+    // ── Fallback selectors (in case LinkedIn renames the attribute) ──
+
+    // Any button whose data-view-name contains "resume"
+    document
+      .querySelectorAll('button[data-view-name*="resume" i]')
+      .forEach((el) => found.add(el));
+
+    // Any button that contains a span whose text is exactly "Resume"
+    document.querySelectorAll("button").forEach((btn) => {
+      const spans = btn.querySelectorAll("span");
+      for (const span of spans) {
+        const text = span.textContent.trim();
+        if (text === "Resume" || text === "resume") {
+          found.add(btn);
+          break;
+        }
       }
     });
 
-    resumeButtons = [...found];
+    // Any button containing SVG #document-small (the resume icon)
+    document.querySelectorAll('button svg[id="document-small"]').forEach((svg) => {
+      const btn = svg.closest("button");
+      if (btn) found.add(btn);
+    });
+
+    // Aria-label patterns
+    try {
+      document
+        .querySelectorAll('button[aria-label*="resume" i], button[aria-label*="Resume" i]')
+        .forEach((el) => found.add(el));
+    } catch (_) {}
+
+    // Convert to array and attach candidate names
+    resumeButtons = [...found].map((btn) => ({
+      element: btn,
+      candidateName: extractCandidateName(btn),
+    }));
+
     return resumeButtons.length;
   }
 
+  // ══════════════════════════════════════════════════════════
+  //  STEP 2 — FIND THE "Download" BUTTON INSIDE THE POPUP
+  // ══════════════════════════════════════════════════════════
+
   /**
-   * Attempt to intercept the actual download URL.
-   * LinkedIn usually triggers a fetch/XHR when the download button is clicked;
-   * we listen for that network request and capture the URL.
+   * After clicking the "Resume" button, a preview popup appears.
+   * We need to wait for it and find the download button inside.
+   * Returns the download button element, or null.
    */
-  function interceptDownloadUrl(button) {
-    return new Promise((resolve) => {
-      // If the element is a direct <a> with href, just use that
-      if (button.tagName === "A" && button.href) {
-        resolve(button.href);
-        return;
+  async function waitForDownloadButton(maxWaitMs = 8000) {
+    const start = Date.now();
+
+    while (Date.now() - start < maxWaitMs) {
+      // Strategy 1: button containing svg#download-small
+      const svgIcon = document.querySelector('svg[id="download-small"]');
+      if (svgIcon) {
+        const btn = svgIcon.closest("button");
+        if (btn) return btn;
       }
 
-      // Otherwise, set up a temporary observer for any new <a> downloads or
-      // network fetches triggered by clicking the button.
-      let resolved = false;
-
-      // Intercept via download attribute trick
-      const observer = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-          for (const node of m.addedNodes) {
-            if (node.tagName === "A" && node.href) {
-              resolved = true;
-              observer.disconnect();
-              resolve(node.href);
-              return;
-            }
+      // Strategy 2: button containing a span with text "Download"
+      const allButtons = document.querySelectorAll("button");
+      for (const btn of allButtons) {
+        const spans = btn.querySelectorAll("span");
+        for (const span of spans) {
+          const text = span.textContent.trim();
+          if (text === "Download" || text === "download") {
+            return btn;
           }
         }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
+      }
 
-      // Monkey-patch fetch temporarily to capture the resume URL
-      const origFetch = window.fetch;
-      window.fetch = async function (...args) {
-        const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
+      // Strategy 3: button with aria-label containing "download"
+      try {
+        const ariaBtn = document.querySelector(
+          'button[aria-label*="Download" i], a[aria-label*="Download" i]'
+        );
+        if (ariaBtn) return ariaBtn;
+      } catch (_) {}
+
+      // Strategy 4: any <a> link that looks like a direct resume download
+      const links = document.querySelectorAll("a[href]");
+      for (const a of links) {
+        const href = (a.href || "").toLowerCase();
         if (
-          !resolved &&
-          (url.includes("resume") || url.includes("media") || url.includes(".pdf"))
+          (href.includes("resume") || href.includes("media") || href.includes(".pdf")) &&
+          !href.includes("/hiring/") // exclude navigation links
         ) {
-          resolved = true;
-          observer.disconnect();
-          window.fetch = origFetch;
-          resolve(url);
+          return a;
         }
-        return origFetch.apply(this, args);
-      };
+      }
 
-      // Click the button
-      button.scrollIntoView({ behavior: "smooth", block: "center" });
-      setTimeout(() => {
-        button.click();
+      await sleep(500);
+    }
 
-        // Fallback: if nothing intercepted in 4 seconds, resolve empty
-        setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            observer.disconnect();
-            window.fetch = origFetch;
-            resolve("");
-          }
-        }, 4000);
-      }, 500);
-    });
+    return null;
   }
 
-  // ── Main Download Loop ──────────────────────────────────
+  /**
+   * Try to close the resume preview popup/modal after downloading.
+   */
+  function closePreviewPopup() {
+    // Look for common close/dismiss buttons
+    const closeSelectors = [
+      'button[aria-label="Dismiss"]',
+      'button[aria-label="Close"]',
+      'button[aria-label="dismiss"]',
+      'button[aria-label="close"]',
+      ".artdeco-modal__dismiss",
+      'button[data-test-modal-close-btn]',
+    ];
+
+    for (const sel of closeSelectors) {
+      const closeBtn = document.querySelector(sel);
+      if (closeBtn) {
+        closeBtn.click();
+        return true;
+      }
+    }
+
+    // Fallback: look for any X / close icon button in a modal
+    const modals = document.querySelectorAll(
+      '.artdeco-modal, [role="dialog"], [role="presentation"]'
+    );
+    for (const modal of modals) {
+      const closeBtn =
+        modal.querySelector('button[aria-label*="lose" i]') ||
+        modal.querySelector('button[aria-label*="ismiss" i]') ||
+        modal.querySelector("button:first-child");
+      if (closeBtn) {
+        closeBtn.click();
+        return true;
+      }
+    }
+
+    // Last resort: press Escape
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return false;
+  }
+
+  // ── Name Extraction ─────────────────────────────────────
+
+  function extractCandidateName(element) {
+    // 1. Walk up to the applicant card / container
+    const containerSelectors = [
+      ".hiring-applicant-header",
+      ".hiring-applicants__list-item",
+      ".artdeco-entity-lockup",
+      "#hiring-detail-root",
+      ".scaffold-layout__detail",
+      '[data-view-name*="applicant"]',
+      "[data-test-applicant]",
+      ".application-outlet",
+      ".hiring-people-card",
+      "li",
+      "tr",
+      "section",
+    ];
+
+    let card = null;
+    for (const sel of containerSelectors) {
+      card = element.closest(sel);
+      if (card) break;
+    }
+
+    if (card) {
+      const nameSelectors = [
+        ".artdeco-entity-lockup__title",
+        ".hiring-people-card__title",
+        ".application-outlet__name",
+        "h1", "h2", "h3",
+        "span.t-16.t-bold",
+        "span.t-bold",
+        "a[href*='/in/']",
+      ];
+
+      for (const ns of nameSelectors) {
+        const nameEl = card.querySelector(ns);
+        if (nameEl) {
+          const rawText = nameEl.childNodes[0]?.textContent || nameEl.textContent;
+          const cleaned = rawText.trim();
+          if (cleaned.length > 1 && cleaned.length < 80) {
+            return sanitiseName(cleaned);
+          }
+        }
+      }
+    }
+
+    // 2. Try the current detail panel heading
+    const pageH1 = document.querySelector(
+      "#hiring-detail-root h1, .scaffold-layout__detail h1, h1"
+    );
+    if (pageH1) {
+      const name = (pageH1.childNodes[0]?.textContent || pageH1.textContent).trim();
+      if (name.length > 1 && name.length < 80) return sanitiseName(name);
+    }
+
+    return "Unknown_Candidate";
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  MAIN DOWNLOAD LOOP — Two-step: Resume → Preview → Download
+  // ══════════════════════════════════════════════════════════
 
   async function startBulkDownload() {
     stopRequested = false;
@@ -188,39 +267,54 @@
         return;
       }
 
-      const btn = resumeButtons[i];
-      const candidateName = extractCandidateName(btn);
+      const item = resumeButtons[i];
+      const candidateName = item.candidateName;
 
       try {
-        // Scroll to button so it's visible (mimic human behaviour)
-        btn.scrollIntoView({ behavior: "smooth", block: "center" });
-        await sleep(800);
+        // ── Step 1: Scroll to and click the "Resume" preview button ──
+        item.element.scrollIntoView({ behavior: "smooth", block: "center" });
+        await sleep(1000);
 
-        // Try to get the download URL
-        const downloadUrl = await interceptDownloadUrl(btn);
+        item.element.click();
+        notify("LOG", { message: `Opened resume preview for ${candidateName}` });
 
-        if (downloadUrl) {
-          // Send URL to background for clean download with proper filename
-          chrome.runtime.sendMessage({
-            type: "DOWNLOAD_RESUME",
-            url: downloadUrl,
-            candidateName: candidateName,
-          });
-          downloaded++;
-        } else {
-          // Fallback: just click the button directly (LinkedIn will trigger
-          // a native download)
-          btn.click();
-          downloaded++;
+        // ── Step 2: Wait for the popup & find the Download button ──
+        await sleep(1500); // let the popup animate in
+        const downloadBtn = await waitForDownloadButton(8000);
+
+        if (!downloadBtn) {
+          notify("LOG", { message: `No download button found for ${candidateName}` });
+          failed++;
+          closePreviewPopup();
+          await sleep(500);
+          notify("PROGRESS", { downloaded, total, failed });
+          continue;
         }
 
-        // Notify popup of progress
-        notify("PROGRESS", {
-          downloaded,
-          total,
-          failed,
-          candidateName,
-        });
+        // ── Step 3: Click the Download button ──
+        downloadBtn.scrollIntoView({ behavior: "smooth", block: "center" });
+        await sleep(500);
+
+        // If it's a direct link, send URL to background for clean naming
+        if (downloadBtn.tagName === "A" && downloadBtn.href) {
+          chrome.runtime.sendMessage({
+            type: "DOWNLOAD_RESUME",
+            url: downloadBtn.href,
+            candidateName: candidateName,
+          });
+        } else {
+          // Click the button — LinkedIn will handle the download natively
+          downloadBtn.click();
+        }
+
+        downloaded++;
+        notify("PROGRESS", { downloaded, total, failed, candidateName });
+
+        // ── Step 4: Close the preview popup ──
+        await sleep(1500);
+        closePreviewPopup();
+        await sleep(800);
+
       } catch (err) {
         failed++;
         chrome.runtime.sendMessage({
@@ -229,9 +323,13 @@
           error: err.message,
         });
         notify("PROGRESS", { downloaded, total, failed });
+
+        // Try to clean up any open popup
+        closePreviewPopup();
+        await sleep(500);
       }
 
-      // ── Human-like delay (5-15 s) before next download ──
+      // ── Human-like delay (5–15 s) before next applicant ──
       if (i < resumeButtons.length - 1 && !stopRequested) {
         await randomDelay(5, 15);
       }
@@ -240,9 +338,69 @@
     notify("DONE", { downloaded, total, failed });
   }
 
-  /** Send a message to popup / background */
+  // ── Debug Scan ──────────────────────────────────────────
+
+  function debugScan() {
+    const info = {
+      url: window.location.href,
+      totalButtons: document.querySelectorAll("button").length,
+      totalLinks: document.querySelectorAll("a").length,
+    };
+
+    // Count "Resume" preview buttons
+    const resumeBtns = document.querySelectorAll(
+      'button[data-view-name="hiring-applicant-view-resume"]'
+    );
+    info.resumePreviewButtons = resumeBtns.length;
+
+    // Check for the download icon
+    const downloadIcons = document.querySelectorAll('svg[id="download-small"]');
+    info.downloadIconsVisible = downloadIcons.length;
+
+    // All buttons with data-view-name
+    const dataViewButtons = document.querySelectorAll("button[data-view-name]");
+    info.dataViewButtons = [...dataViewButtons].map((el) => ({
+      dataViewName: el.getAttribute("data-view-name"),
+      text: el.textContent.trim().substring(0, 60),
+    }));
+
+    // All buttons whose text contains "Resume" or "Download"
+    info.relevantButtons = [];
+    document.querySelectorAll("button").forEach((btn) => {
+      const text = btn.textContent.trim().toLowerCase();
+      if (text.includes("resume") || text.includes("download")) {
+        info.relevantButtons.push({
+          text: btn.textContent.trim().substring(0, 60),
+          dataViewName: btn.getAttribute("data-view-name") || "",
+          ariaLabel: btn.getAttribute("aria-label") || "",
+          className: (btn.className || "").toString().substring(0, 80),
+        });
+      }
+    });
+
+    // All leaf elements with "resume" or "download" text
+    info.allResumeDownloadLeafs = [];
+    document.querySelectorAll("*").forEach((node) => {
+      if (node.children.length > 0) return;
+      const text = (node.textContent || "").toLowerCase();
+      if (text.includes("resume") || text.includes("download")) {
+        info.allResumeDownloadLeafs.push({
+          tag: node.tagName,
+          text: node.textContent.trim().substring(0, 60),
+          parentTag: node.parentElement?.tagName || "",
+          parentDataView: node.parentElement?.getAttribute?.("data-view-name") || "",
+        });
+        if (info.allResumeDownloadLeafs.length >= 30) return;
+      }
+    });
+
+    return info;
+  }
+
+  // ── Messaging ───────────────────────────────────────────
+
   function notify(type, data) {
-    chrome.runtime.sendMessage({ type, ...data });
+    chrome.runtime.sendMessage({ type, ...data }).catch(() => {});
   }
 
   // ── Message Listener ────────────────────────────────────
@@ -250,8 +408,14 @@
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg.action) {
       case "SCAN_RESUMES": {
-        const count = scanForButtons();
+        const count = scanForResumeButtons();
         sendResponse({ count });
+        break;
+      }
+
+      case "DEBUG_SCAN": {
+        const info = debugScan();
+        sendResponse({ debug: info });
         break;
       }
 
@@ -269,6 +433,8 @@
         sendResponse({ ok: false });
     }
 
-    return true; // keep channel open for async response
+    return true;
   });
+
+  console.log("[LBRD] LinkedIn Bulk Resume Downloader content script loaded.");
 })();
